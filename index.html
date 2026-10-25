@@ -649,14 +649,14 @@ function separatePair(ea, eb) {
   var ddx = eb.x - ea.x, ddy = eb.y - ea.y;
   var dd = Math.sqrt(ddx * ddx + ddy * ddy);
   var minD = ea.r + eb.r;
-  if (dd >= minD) return;
+  if (dd >= minD - 1) return;                     // 轻微重叠不用推，避免挤压时抖动
   var nx, ny;
   if (dd < 0.001) {
     var ra = rnd(0, 6.283);
     nx = Math.cos(ra); ny = Math.sin(ra);
     dd = 0.001;
   } else { nx = ddx / dd; ny = ddy / dd; }
-  var push = (minD - dd) * 0.52;
+  var push = Math.min((minD - dd) * 0.35, 1.1);   // 单帧最大推开量有限
   moveEnt(ea, -nx * push, -ny * push);
   moveEnt(eb, nx * push, ny * push);
 }
@@ -698,7 +698,9 @@ function canBe(x, y, r) {
 function moveEnt(e, dx, dy) {
   var moved = 0;
   if (canBe(e.x + dx, e.y, e.r)) { e.x += dx; moved += Math.abs(dx); }
+  else if (e.mvx !== undefined) e.mvx *= 0.2;   // 撞墙的轴衰减掉，避免速度累积后反弹抽动
   if (canBe(e.x, e.y + dy, e.r)) { e.y += dy; moved += Math.abs(dy); }
+  else if (e.mvy !== undefined) e.mvy *= 0.2;
   return moved;
 }
 function safeSpot(x, y, r) {
@@ -738,6 +740,7 @@ function makePlayer(x, y) {
     x: x, y: y, vx: 0, vy: 0, r: 18, ang: -Math.PI / 2,
     hp: maxHp, maxHp: maxHp, dashCdT: 0, dashT: 0, dashAng: 0,
     invulT: 0, shield: S.upg.shield * 20, skillCd: [0, 0, 0], serumT: 0, atkCdT: 0, atkT: 0,
+    swapCdT: 0,   // 切换武器冷却
     critT: 0, speedT: 0, atkFlash: 0,
     speed: 320, bob: 0, step: 0
   };
@@ -1009,9 +1012,16 @@ function curWKey() {
   return (S.equip && S.equip.w[0]) || 'blade';
 }
 function curW() { return WEAPONS[curWKey()] || WEAPONS.blade; }
+var SWAP_CD = 0.5;   // 切换武器冷却（秒）
 function swapWeapon() {
   if (!R || !R.weapons || R.weapons.length < 2) return;
+  if ((P.swapCdT || 0) > 0) {
+    flashMsg('武器切换冷却中 ' + P.swapCdT.toFixed(1) + 's');
+    sfx('ui');
+    return;
+  }
   R.wi = (R.wi + 1) % R.weapons.length;
+  P.swapCdT = SWAP_CD;
   P.atkCdT = Math.min(P.atkCdT, 0.12);
   sfx('ui');
   var w = WEAPONS[R.weapons[R.wi]];
@@ -1392,6 +1402,13 @@ function unstick(e) {
 function updateEnemy(e, dt) {
   var dx = P.x - e.x, dy = P.y - e.y, d = Math.hypot(dx, dy) || 1;
   e.t += dt;
+  // 用上一帧的真实位移判断“是不是被墙挤住了”（视线在拐角会误判）
+  if (e.lastX !== undefined) {
+    var mvChk = Math.abs(e.x - e.lastX) + Math.abs(e.y - e.lastY);
+    if (mvChk < e.speed * dt * 0.4) e.moveStuck = (e.moveStuck || 0) + dt;
+    else e.moveStuck = Math.max(0, (e.moveStuck || 0) - dt);
+  }
+  e.lastX = e.x; e.lastY = e.y;
   if (e.popAcc > 0 && (R.time || 0) >= (e.popAt || 0)) flushPop(e);
   e.cd = Math.max(0, e.cd - dt);
   e.hurtT = Math.max(0, e.hurtT - dt);
@@ -1410,28 +1427,51 @@ function updateEnemy(e, dt) {
     return;
   }
 
-  // 视线与寻路
-  var los = hasLOS(e.x, e.y, P.x, P.y);
-  var movAng = Math.atan2(dy, dx);
-  if (!los) {
+  // 视线（按敌人所在格中心算，亚像素抖动不会让视线忽有忽无）
+  var etx = Math.floor(e.x / TILE), ety = Math.floor(e.y / TILE);
+  var los = hasLOS(etx * TILE + TILE / 2, ety * TILE + TILE / 2, P.x, P.y);
+  // 导航方向快照：每 0.2s 才重算一次，避免在格子边界上每帧左右横跳
+  e.navT = (e.navT || 0) - dt;
+  if (e.navT <= 0 || e.navAng === undefined) {
+    e.navT = 0.2;
+    var want = Math.atan2(dy, dx);
     var fa = flowAngle(e.x, e.y);
-    if (fa !== null) movAng = fa;
+    if (!los) {
+      if (fa !== null) want = fa;
+    } else {
+      // 拐角处视线可能“擦过”墙：向前探一段，走不通就改用流场绕路
+      var probe = e.r + 26;
+      if (!canBe(e.x + Math.cos(want) * probe, e.y + Math.sin(want) * probe, e.r) && fa !== null) want = fa;
+    }
+    // 真被卡住了（几乎没走动）则强制沿流场绕
+    if ((e.moveStuck || 0) > 0.15 && fa !== null) want = fa;
+    e.navAng = want;
+    e.navLos = los;
   }
+  var movAng = e.navAng;
+  var slos = e.navLos === undefined ? los : e.navLos;
+  e.navFlow = !los;
   var spd = e.speed;
   e.timer -= dt;
   e.burstT -= dt;
+  e.moveAng = movAng;   // 调试/表现用：本帧实际用的移动方向
   var beh = e.behavior || 'chase';
+  // 本帧的期望位移先累加，最后统一平滑应用，避免方向翻转时来回抖
+  var wdx = 0, wdy = 0;
   var sp2 = function (ang, k) {
-    moveEnt(e, Math.cos(ang) * spd * (k === undefined ? 1 : k) * dt, Math.sin(ang) * spd * (k === undefined ? 1 : k) * dt);
+    var f = spd * (k === undefined ? 1 : k) * dt;
+    wdx += Math.cos(ang) * f;
+    wdy += Math.sin(ang) * f;
   };
 
   if (beh === 'chase') {
     sp2(movAng, e.type === 'cube' ? (1 + Math.sin(e.t * 2) * 0.25) : 1);
 
   } else if (beh === 'ranged') {
-    if (!los) sp2(movAng);
+    if (!slos) sp2(movAng);
     else {
-      var want = d > 330 ? 1 : (d < 230 ? -1 : 0);
+      // 径向速度按距离误差连续变化，避免在临界距离上每帧正反切
+      var want = clamp((d - 280) / 70, -1, 1);
       sp2(Math.atan2(dy, dx), want);
       sp2(Math.atan2(dy, dx) + Math.PI / 2, 0.5);
     }
@@ -1473,9 +1513,20 @@ function updateEnemy(e, dt) {
     sp2(movAng);
 
   } else if (beh === 'orbiter') {
-    var rad = d > 300 ? 1 : (d < 240 ? -1 : 0);
-    sp2(Math.atan2(dy, dx), rad);
-    sp2(Math.atan2(dy, dx) + Math.PI / 2, 0.8);
+    // 远近两种模式带滞回，避免在临界距离上每帧来回切导致抖动
+    if (e.orbFar === undefined) e.orbFar = d > 320;
+    if (d > 345) e.orbFar = true; else if (d < 295) e.orbFar = false;
+    if (e.orbFar) {
+      var nf = flowAngle(e.x, e.y);
+      sp2(nf === null ? Math.atan2(dy, dx) : nf, 1);
+      e.moveRad = 1;
+    } else {
+      // 期望距离 270px：径向速度按误差连续变化，不做硬切换（否则会在边界上抖）
+      var radial = clamp((d - 270) / 80, -1, 1);
+      e.moveRad = radial;
+      sp2(movAng, radial);
+      if (slos) sp2(movAng + Math.PI / 2, 0.8);
+    }
     e.shootT -= dt;
     if (e.shootT <= 0 && los && d < 680) {
       e.shootT = 1.4;
@@ -1530,7 +1581,7 @@ function updateEnemy(e, dt) {
     sp2(movAng, 0.9);
 
   } else if (beh === 'laser') {
-    var lw = d > 430 ? 1 : (d < 300 ? -1 : 0);
+    var lw = clamp((d - 365) / 80, -1, 1);
     sp2(movAng, lw);
     if (!e.beam && e.timer <= 0 && los && d < 900) {
       e.beam = { ang: Math.atan2(dy, dx), t: 0, fired: false };
@@ -1576,6 +1627,12 @@ function updateEnemy(e, dt) {
   } else {
     sp2(movAng);
   }
+
+  // 平滑移动：即使寻路方向在帧间翻转，本体也只是微微偏移而不是抽动
+  var sm = 0.45;
+  e.mvx = (e.mvx || 0) + (wdx - (e.mvx || 0)) * sm;
+  e.mvy = (e.mvy || 0) + (wdy - (e.mvy || 0)) * sm;
+  if (Math.abs(e.mvx) + Math.abs(e.mvy) > 0.02) moveEnt(e, e.mvx, e.mvy);
 
   if (d < e.r + P.r && e.cd <= 0) {
     e.cd = 0.85;
@@ -2310,6 +2367,7 @@ function updateStage(dt) {
 
   P.atkCdT = Math.max(0, P.atkCdT - dt);
   P.atkT = Math.max(0, P.atkT - dt);
+  P.swapCdT = Math.max(0, (P.swapCdT || 0) - dt);
   P.invulT = Math.max(0, P.invulT - dt);
   P.dashCdT = Math.max(0, P.dashCdT - dt);
   P.skillCd[0] = Math.max(0, P.skillCd[0] - dt);
@@ -2354,11 +2412,11 @@ function updateStage(dt) {
     if (ea.dead) continue;
     var pdx = ea.x - P.x, pdy = ea.y - P.y;
     var pd = Math.sqrt(pdx * pdx + pdy * pdy);
-    if (pd > 0.01 && pd < ea.r + P.r) {
-      var ov = (ea.r + P.r - pd) * 0.5;
+    if (pd > 0.01 && pd < ea.r + P.r - 1.5) {
+      var ov = Math.min((ea.r + P.r - pd) * 0.32, 1.0);
       var pnx = pdx / pd, pny = pdy / pd;
       moveEnt(ea, pnx * ov, pny * ov);
-      moveEnt(P, -pnx * ov * 0.7, -pny * ov * 0.7);
+      moveEnt(P, -pnx * ov * 0.6, -pny * ov * 0.6);
     }
   }
   if (R.boss) updateBoss(R.boss, edt);
@@ -3428,7 +3486,10 @@ function drawStageHud() {
   txt(Math.ceil(P.hp) + ' / ' + P.maxHp, pad + hw + 12, 43, 11, 'rgba(190,215,240,0.8)');
 
   var w = curW();
-  txt(w.name + (R.weapons.length > 1 ? '   [Tab 切换]' : ''), pad, 70, 12, w.color, 'left', '600');
+  var swapTxt = R.weapons.length > 1
+    ? ((P.swapCdT || 0) > 0 ? '   [切换冷却 ' + P.swapCdT.toFixed(1) + 's]' : '   [Tab 切换]')
+    : '';
+  txt(w.name + swapTxt, pad, 70, 12, (P.swapCdT || 0) > 0 ? 'rgba(160,185,212,0.72)' : w.color, 'left', '600');
   var keyLabels = ['R', 'F', 'C'];
   for (var si = 0; si < 3; si++) {
     var skey = R.skills[si];
