@@ -266,7 +266,7 @@ function sfxInner(n) {
    ========================================================= */
 var SAVE_KEY = 'ruins_ember_v2';
 // 改装上限必须在读档之前就存在（normalizeSave 会用它做夹取）
-var MOD_MAX = { dmg: 12, cd: 8, extra: 3 };
+var MOD_MAX = { dmg: 20, cd: 12, extra: 5 };
 function defaultSave() {
   return {
     scrap: 0, unlocked: 0, cleared: [], bag: [],
@@ -842,7 +842,7 @@ function buildStage(stage) {
       for (var sc = 0; sc < cnt2; sc++) {
         var ex = (room.x + 1 + Math.random() * (room.w - 2)) * TILE;
         var ey = (room.y + 1 + Math.random() * (room.h - 2)) * TILE;
-        spawnEnemy(t, ex + rnd(-18, 18), ey + rnd(-18, 18), 1 + stage.id * 0.28, room);
+        spawnEnemy(t, ex + rnd(-18, 18), ey + rnd(-18, 18), 1, room);
       }
     }
   }
@@ -995,10 +995,21 @@ function buyItem(key, price) {
   S.scrap -= price; addItem(key); persist();
   flashMsg('已购买 ' + ITEMS[key].name);
 }
+/* 永久强化表（商店与调试共用） */
+function shopUpgList() {
+  return [
+    { k: 'dmg', name: '伤害 +6%', unit: 70, step: 45, max: 10, cur: S.upg.dmg },
+    { k: 'hp', name: '生命 +15', unit: 70, step: 45, max: 10, cur: S.upg.hp },
+    { k: 'dash', name: '冲刺冷却 -8%', unit: 60, step: 35, max: 8, cur: S.upg.dash },
+    { k: 'crit', name: '暴击率 +3%', unit: 80, step: 50, max: 10, cur: S.upg.crit },
+    { k: 'shield', name: '初始护盾 +20', unit: 90, step: 55, max: 6, cur: S.upg.shield }
+  ];
+}
 function buyUpg(u) {
   if (u.cur >= u.max) return;
-  if (S.scrap < u.price) { flashMsg('零件不足'); return; }
-  S.scrap -= u.price; S.upg[u.k]++; persist();
+  var price = (u.unit || u.price) + S.upg[u.k] * (u.step || 0);
+  if (S.scrap < price) { flashMsg('零件不足'); return; }
+  S.scrap -= price; S.upg[u.k]++; persist();
   flashMsg('强化完成');
 }
 function flashMsg(t) { msgFlash = { text: t, t: 1.8 }; }
@@ -1050,7 +1061,7 @@ function attack() {
   var wkey = curWKey();
   var w = WEAPONS[wkey];
   var mm = weaponMods(wkey);
-  P.atkCdT = w.cd * R.mods.cd * Math.max(0.3, 1 - 0.08 * mm.cd);
+  P.atkCdT = w.cd * R.mods.cd * Math.pow(0.9, mm.cd);
   var wDmgK = 1 + 0.15 * mm.dmg;
   P.atkT = 0.16;
   P.atkFlash = 0.16;
@@ -1319,14 +1330,18 @@ function liveAwake() {
 function spawnEnemy(type, x, y, hpScale, room) {
   var t = ETYPES[type] || ETYPES.shard;
   var sp = (world && world.map) ? freeSpawn(x, y, t.r) : { x: x, y: y };
+  // 随关卡提升：血量 +28% / 层，伤害 +9% / 层
+  var sid = (R && R.stage && R.stage.id) ? R.stage.id : 0;
+  var hpm = (hpScale === undefined ? 1 : hpScale) * (1 + sid * 0.28);
+  var dmgMul = 1 + sid * 0.09;
   var e = {
     x: sp.x, y: sp.y, r: t.r, type: type, color: t.color, sides: t.sides,
-    hp: t.hp * hpScale, maxHp: t.hp * hpScale, speed: t.speed, dmg: t.dmg,
+    hp: Math.round(t.hp * hpm), maxHp: Math.round(t.hp * hpm), speed: t.speed, dmg: t.dmg * dmgMul,
     ang: rnd(0, 6.283), cd: 0, hurtT: 0, dead: false, isBoss: false,
     scrap: t.scrap, t: rnd(0, 6), shootT: rnd(0.6, 1.8), room: room || null,
     awake: false, hx: sp.x, hy: sp.y, behavior: t.behavior || 'chase',
     state: '', timer: 0, dashT: 0, dashAng: 0, burst: 0, burstT: 0,
-    beam: null, shieldHp: t.behavior === 'shielder' ? 90 * hpScale : 0
+    beam: null, shieldHp: t.behavior === 'shielder' ? Math.round(90 * hpm) : 0
   };
   R.enemies.push(e);
   return e;
@@ -1676,8 +1691,8 @@ function spawnBoss(key) {
       var one = (qm.dmg || 0) + (qm.cd || 0) + (qm.extra || 0);
       if (one > tot) tot = one;
     }
-    var full = MOD_MAX.dmg + MOD_MAX.cd + MOD_MAX.extra;   // 23
-    hpScale = 1 + Math.pow(Math.min(1, tot / full), 1.5) * 7.6;
+    var full = MOD_MAX.dmg + MOD_MAX.cd + MOD_MAX.extra;   // 37
+    hpScale = 1 + Math.pow(Math.min(1, tot / full), 1.5) * 21;
   }
   var bh = Math.round(def.hp * hpScale);
   var b = {
@@ -4565,7 +4580,7 @@ function drawModPanel(x, y, w, h) {
       var mm = weaponMods(k);
       var tags = [];
       if (mm.dmg) tags.push('伤+' + (mm.dmg * 15) + '%');
-      if (mm.cd) tags.push('冷-' + (mm.cd * 8) + '%');
+      if (mm.cd) tags.push('冷×' + Math.pow(0.9, mm.cd).toFixed(2));
       if (mm.extra) tags.push('特×' + mm.extra);
       var bx = x + 28 + (idx % 3) * (cw3 + 10);
       var by = y + 76 + Math.floor(idx / 3) * 54;
@@ -4602,7 +4617,9 @@ function drawModPanel(x, y, w, h) {
         ? (wx.type === 'melee'
             ? '每级：+12% 攻击角   ·   当前 +' + total + '%'
             : '每级：+1 弹丸   ·   当前 ' + ((wx.count || 1) + lv) + ' 弹')
-        : '每级 ' + row.sign + row.per + '% ' + (row.key === 'dmg' ? '伤害' : '冷却') + '   ·   当前 ' + row.sign + total + '%';
+        : (row.key === 'cd'
+            ? '每级 冷却 ×0.90   ·   当前 ×' + Math.pow(0.9, lv).toFixed(2)
+            : '每级 ' + row.sign + row.per + '% 伤害   ·   当前 ' + row.sign + total + '%');
       txt(desc, x + 44, by2 + 36, 10.5, 'rgba(140,175,210,0.6)');
       var pipGap = Math.min(20, 190 / row.max);
       var pipW = Math.max(4, Math.min(15, pipGap - 4));
@@ -4631,7 +4648,7 @@ function drawModPanel(x, y, w, h) {
   ctx.restore();
   txt('总览', x + 44, sumY + 19, 11, 'rgba(255,200,87,0.8)', 'left', '600');
   var sumLine = '伤害 ×' + (1 + 0.15 * lm.dmg).toFixed(2) +
-    '    ·    冷却 ×' + Math.max(0.3, 1 - 0.08 * lm.cd).toFixed(2) +
+    '    ·    冷却 ×' + Math.pow(0.9, lm.cd).toFixed(2) +
     '    ·    ' + (wx.type === 'melee'
       ? '攻击角 +' + (12 * lm.extra) + '%'
       : '弹丸 ' + ((wx.count || 1) + lm.extra) + ' 发');
@@ -4696,18 +4713,13 @@ function drawShopPanel(x, y, w, h) {
   var rx = x + 28 + areaW + 42;
   var rw = w - (rx - x) - 28;
   txt('永 久 强 化', rx, y + 68, 12, 'rgba(150,180,210,0.7)', 'left', '600');
-  var ups = [
-    { k: 'dmg', name: '伤害 +6%', price: 70, max: 5, cur: S.upg.dmg },
-    { k: 'hp', name: '生命 +15', price: 70, max: 5, cur: S.upg.hp },
-    { k: 'dash', name: '冲刺冷却 -8%', price: 60, max: 5, cur: S.upg.dash },
-    { k: 'crit', name: '暴击率 +3%', price: 80, max: 5, cur: S.upg.crit },
-    { k: 'shield', name: '初始护盾 +20', price: 90, max: 3, cur: S.upg.shield }
-  ];
+  var ups = shopUpgList();
   for (var u = 0; u < ups.length; u++) {
     var up = ups[u];
     var full = up.cur >= up.max;
+    var price = up.unit + up.cur * up.step;
     button(rx, y + 84 + u * 56, rw, 48, up.name, '等级 ' + up.cur + ' / ' + up.max, {
-      color: C.teal, disabled: full, right: full ? '已满' : up.price, rightColor: C.gold,
+      color: C.teal, disabled: full, right: full ? '已满' : price, rightColor: C.gold,
       fn: (function (uu) { return function () { buyUpg(uu); }; })(up)
     });
   }
@@ -4779,6 +4791,8 @@ window.__DBG = {
   tryInteract: tryInteract, spawnEnemy: spawnEnemy, addItem: addItem,
   killEnemy: killEnemy, spawnBoss: spawnBoss, hurt: function (d) { hurtPlayer(d); },
   setPanel: function (p) { panel = p; },
+  shopUps: function () { return shopUpgList(); },
+  buyUpg: function (u) { buyUpg(u); },
   setHubSel: function (i) { hubSel = i; },
   get hubSel() { return hubSel; },
   setCodexBossSel: function (i) { codexBossSel = i; },
